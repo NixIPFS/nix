@@ -27,8 +27,10 @@
     <arg><option>- -show-progress</option></arg>
     -->
     <arg><option>--include-outputs</option></arg>
-    <arg><option>--use-substitutes</option></arg>
-    <arg><option>-s</option></arg>
+    <group>
+      <arg choice='plain'><option>--use-substitutes</option></arg>
+      <arg choice='plain'><option>-s</option></arg>
+    </group>
     <arg><option>-v</option></arg>
     <arg choice='plain'>
       <replaceable>user@</replaceable><replaceable>machine</replaceable>
@@ -92,15 +94,6 @@ those paths.  If this bothers you, use
     connection.</para></listitem>
 
   </varlistentry>
-
-  <!--
-  <varlistentry><term><option>- -show-progress</option></term>
-
-    <listitem><para>Show the progress of each path's transfer as it's made.
-    This requires the <command>pv</command> utility to be in <envar>PATH</envar>.</para></listitem>
-
-  </varlistentry>
-  -->
 
   <varlistentry><term><option>--include-outputs</option></term>
 

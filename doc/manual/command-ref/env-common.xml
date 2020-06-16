@@ -14,7 +14,8 @@
 <varlistentry><term><envar>IN_NIX_SHELL</envar></term>
 
   <listitem><para>Indicator that tells if the current environment was set up by
-  <command>nix-shell</command>.</para></listitem>
+  <command>nix-shell</command>.  Since Nix 2.0 the values are
+  <literal>"pure"</literal> and <literal>"impure"</literal></para></listitem>
 
 </varlistentry>
 
@@ -32,7 +33,7 @@
 
     will cause Nix to look for paths relative to
     <filename>/home/eelco/Dev</filename> and
-    <filename>/etc/nixos</filename>, in that order.  It is also
+    <filename>/etc/nixos</filename>, in this order.  It is also
     possible to match paths against a prefix.  For example, the value
 
     <screen>
@@ -52,10 +53,15 @@ nixpkgs=/home/eelco/Dev/nixpkgs-branch:/etc/nixos</screen>
     <envar>NIX_PATH</envar> to
 
     <screen>
-nixpkgs=https://github.com/NixOS/nixpkgs-channels/archive/nixos-14.12.tar.gz</screen>
+nixpkgs=https://github.com/NixOS/nixpkgs/archive/nixos-15.09.tar.gz</screen>
 
     tells Nix to download the latest revision in the Nixpkgs/NixOS
-    14.12 channel.</para>
+    15.09 channel.</para>
+
+    <para>A following shorthand can be used to refer to the official channels:
+
+    <screen>nixpkgs=channel:nixos-15.09</screen>
+    </para>
 
     <para>The search path can be extended using the <option
     linkend="opt-I">-I</option> option, which takes precedence over
@@ -116,7 +122,7 @@ $ mount -o bind /mnt/otherdisk/nix /nix</screen>
 <varlistentry><term><envar>NIX_LOG_DIR</envar></term>
 
   <listitem><para>Overrides the location of the Nix log directory
-  (default <filename><replaceable>prefix</replaceable>/log/nix</filename>).</para></listitem>
+  (default <filename><replaceable>prefix</replaceable>/var/log/nix</filename>).</para></listitem>
 
 </varlistentry>
 
@@ -131,12 +137,19 @@ $ mount -o bind /mnt/otherdisk/nix /nix</screen>
 
 <varlistentry><term><envar>NIX_CONF_DIR</envar></term>
 
-  <listitem><para>Overrides the location of the Nix configuration
+  <listitem><para>Overrides the location of the system Nix configuration
   directory (default
   <filename><replaceable>prefix</replaceable>/etc/nix</filename>).</para></listitem>
 
 </varlistentry>
 
+<varlistentry><term><envar>NIX_USER_CONF_FILES</envar></term>
+
+  <listitem><para>Overrides the location of the user Nix configuration files
+  to load from (defaults to the XDG spec locations). The variable is treated
+  as a list separated by the <literal>:</literal> token.</para></listitem>
+
+</varlistentry>
 
 <varlistentry><term><envar>TMPDIR</envar></term>
 
@@ -148,145 +161,14 @@ $ mount -o bind /mnt/otherdisk/nix /nix</screen>
 </varlistentry>
 
 
-<varlistentry xml:id="envar-build-hook"><term><envar>NIX_BUILD_HOOK</envar></term>
-
-  <listitem>
-
-  <para>Specifies the location of the <emphasis>build hook</emphasis>,
-  which is a program (typically some script) that Nix will call
-  whenever it wants to build a derivation.  This is used to implement
-  distributed builds<phrase condition="manual"> (see <xref
-  linkend="chap-distributed-builds" />)</phrase>.</para>
-
-  <!--
-  The protocol by
-  which the calling Nix process and the build hook communicate is as
-  follows.
-
-  <para>The build hook is called with the following command-line
-  arguments:
-
-  <orderedlist>
-
-    <listitem><para>A boolean value <literal>0</literal> or
-    <literal>1</literal> specifying whether Nix can locally execute
-    more builds, as per the <link
-    linkend="opt-max-jobs"><option>- -max-jobs</option> option</link>.
-    The purpose of this argument is to allow the hook to not have to
-    maintain bookkeeping for the local machine.</para></listitem>
-
-    <listitem><para>The Nix platform identifier for the local machine
-    (e.g., <literal>i686-linux</literal>).</para></listitem>
-
-    <listitem><para>The Nix platform identifier for the derivation,
-    i.e., its <link linkend="attr-system"><varname>system</varname>
-    attribute</link>.</para></listitem>
-
-    <listitem><para>The store path of the derivation.</para></listitem>
-
-  </orderedlist>
-
-  </para>
-
-  <para>On the basis of this information, and whatever persistent
-  state the build hook keeps about other machines and their current
-  load, it has to decide what to do with the build.  It should print
-  out on standard error one of the following responses (terminated by
-  a newline, <literal>"\n"</literal>):
-
-  <variablelist>
-
-    <varlistentry><term><literal># decline</literal></term>
-
-      <listitem><para>The build hook is not willing or able to perform
-      the build; the calling Nix process should do the build itself,
-      if possible.</para></listitem>
-
-    </varlistentry>
-
-    <varlistentry><term><literal># postpone</literal></term>
-
-      <listitem><para>The build hook cannot perform the build now, but
-      can do so in the future (e.g., because all available build slots
-      on remote machines are in use).  The calling Nix process should
-      postpone this build until at least one currently running build
-      has terminated.</para></listitem>
-
-    </varlistentry>
-
-    <varlistentry><term><literal># accept</literal></term>
-
-      <listitem><para>The build hook has accepted the
-      build.</para></listitem>
-
-    </varlistentry>
-
-  </variablelist>
-
-  </para>
-
-  <para>After sending <literal># accept</literal>, the hook should
-  read one line from standard input, which will be the string
-  <literal>okay</literal>.  It can then proceed with the build.
-  Before sending <literal>okay</literal>, Nix will store in the hook’s
-  current directory a number of text files that contain information
-  about the derivation:
-
-  <variablelist>
-
-    <varlistentry><term><filename>inputs</filename></term>
-
-      <listitem><para>The set of store paths that are inputs to the
-      build process (one per line).  These have to be copied
-      <emphasis>to</emphasis> the remote machine (in addition to the
-      store derivation itself).</para></listitem>
-
-    </varlistentry>
-
-    <varlistentry><term><filename>outputs</filename></term>
-
-      <listitem><para>The set of store paths that are outputs of the
-      derivation (one per line).  These have to be copied
-      <emphasis>from</emphasis> the remote machine if the build
-      succeeds.</para></listitem>
-
-    </varlistentry>
-
-    <varlistentry><term><filename>references</filename></term>
-
-      <listitem><para>The reference graph of the inputs, in the format
-      accepted by the command <command>nix-store
-      - -register-validity</command>.  It is necessary to run this
-      command on the remote machine after copying the inputs to inform
-      Nix on the remote machine that the inputs are valid
-      paths.</para></listitem>
-
-    </varlistentry>
-
-  </variablelist>
-
-  </para>
-
-  <para>The hook should copy the inputs to the remote machine,
-  register the validity of the inputs, perform the remote build, and
-  copy the outputs back to the local machine.  An exit code other than
-  <literal>0</literal> indicates that the hook has failed.  An exit
-  code equal to 100 means that the remote build failed (as opposed to,
-  e.g., a network error).</para>
-  -->
-
-  </listitem>
-
-
-</varlistentry>
-
-
 <varlistentry xml:id="envar-remote"><term><envar>NIX_REMOTE</envar></term>
 
   <listitem><para>This variable should be set to
   <literal>daemon</literal> if you want to use the Nix daemon to
   execute Nix operations. This is necessary in <link
   linkend="ssec-multi-user">multi-user Nix installations</link>.
+  If the Nix daemon's Unix socket is at some non-standard path,
+  this variable should be set to <literal>unix://path/to/socket</literal>.
   Otherwise, it should be left unset.</para></listitem>
 
 </varlistentry>

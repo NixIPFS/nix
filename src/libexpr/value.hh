@@ -1,6 +1,5 @@
 #pragma once
 
-#include "config.h"
 #include "symbol-table.hh"
 
 #if HAVE_BOEHMGC
@@ -36,7 +35,6 @@ struct Env;
 struct Expr;
 struct ExprLambda;
 struct PrimOp;
-struct PrimOp;
 class Symbol;
 struct Pos;
 class EvalState;
@@ -44,8 +42,8 @@ class XMLWriter;
 class JSONPlaceholder;
 
 
-typedef long NixInt;
-typedef float NixFloat;
+typedef int64_t NixInt;
+typedef double NixFloat;
 
 /* External values must descend from ExternalValueBase, so that
  * type-agnostic nix functions (e.g. showType) can be implemented
@@ -63,9 +61,6 @@ class ExternalValueBase
 
     /* Return a string to be used in builtins.typeOf */
     virtual string typeOf() const = 0;
-
-    /* How much space does this value take up */
-    virtual size_t valueSize(std::set<const void *> & seen) const = 0;
 
     /* Coerce the value to a string. Defaults to uncoercable, i.e. throws an
      * error
@@ -129,7 +124,7 @@ struct Value
         const char * path;
         Bindings * attrs;
         struct {
-            unsigned int size;
+            size_t size;
             Value * * elems;
         } bigList;
         Value * smallList[2];
@@ -167,7 +162,7 @@ struct Value
         return type == tList1 || type == tList2 ? smallList : bigList.elems;
     }
 
-    unsigned int listSize() const
+    size_t listSize() const
     {
         return type == tList1 ? 1 : type == tList2 ? 2 : bigList.size;
     }
@@ -221,6 +216,14 @@ static inline void mkApp(Value & v, Value & left, Value & right)
 }
 
 
+static inline void mkPrimOpApp(Value & v, Value & left, Value & right)
+{
+    v.type = tPrimOpApp;
+    v.app.left = &left;
+    v.app.right = &right;
+}
+
+
 static inline void mkStringNoCopy(Value & v, const char * s)
 {
     v.type = tString;
@@ -249,19 +252,18 @@ static inline void mkPathNoCopy(Value & v, const char * s)
 void mkPath(Value & v, const char * s);
 
 
-/* Compute the size in bytes of the given value, including all values
-   and environments reachable from it. Static expressions (Exprs) are
-   not included. */
-size_t valueSize(Value & v);
-
-
 #if HAVE_BOEHMGC
-typedef std::vector<Value *, gc_allocator<Value *> > ValueVector;
-typedef std::map<Symbol, Value *, std::less<Symbol>, gc_allocator<Value *> > ValueMap;
+typedef std::vector<Value *, traceable_allocator<Value *> > ValueVector;
+typedef std::map<Symbol, Value *, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, Value *> > > ValueMap;
 #else
 typedef std::vector<Value *> ValueVector;
 typedef std::map<Symbol, Value *> ValueMap;
 #endif
 
+
+/* A value allocated in traceable memory. */
+typedef std::shared_ptr<Value *> RootValue;
+
+RootValue allocRootValue(Value * v);
 
 }

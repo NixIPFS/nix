@@ -1,7 +1,5 @@
 #pragma once
 
-#include "config.h"
-
 #include <map>
 #include <unordered_set>
 
@@ -40,7 +38,12 @@ public:
         return s < s2.s;
     }
 
-    operator const string & () const
+    operator const std::string & () const
+    {
+        return *s;
+    }
+
+    operator const std::string_view () const
     {
         return *s;
     }
@@ -71,12 +74,19 @@ public:
         return Symbol(&*res.first);
     }
 
-    unsigned int size() const
+    size_t size() const
     {
         return symbols.size();
     }
 
     size_t totalSize() const;
+
+    template<typename T>
+    void dump(T callback)
+    {
+        for (auto & s : symbols)
+            callback(s);
+    }
 };
 
 }

@@ -1,7 +1,7 @@
 #include <cstring>
 
 #include "binary-cache-store.hh"
-#include "download.hh"
+#include "filetransfer.hh"
 #include "nar-info-disk-cache.hh"
 #include "ipfs.hh"
 
@@ -44,10 +44,10 @@ public:
       const Params & params, const Path & _cacheUri)
             : BinaryCacheStore(params)
             , cacheUri(_cacheUri)
-            , ipfsAPIHost(get(params, "host", "127.0.0.1"))
-            , ipfsAPIPort(std::stoi(get(params, "port", "5001")))
-            , useIpfsGateway(get(params, "use_gateway", "0") == "1")
-            , ipfsGatewayURL(get(params, "gateway", "https://ipfs.io"))
+            , ipfsAPIHost(get(params, "host").value_or("127.0.0.1"))
+            , ipfsAPIPort(std::stoi(get(params, "port").value_or("5001")))
+            , useIpfsGateway(get(params, "use_gateway").value_or("0") == "1")
+            , ipfsGatewayURL(get(params, "gateway").value_or("https://ipfs.io"))
     {
         if (cacheUri.back() == '/')
             cacheUri.pop_back();
@@ -66,13 +66,16 @@ public:
 
     void init() override
     {
-        if (!diskCache->cacheExists(cacheUri, wantMassQuery_, priority)) {
+        if (auto cacheInfo = diskCache->cacheExists(getUri())) {
+            wantMassQuery.setDefault(cacheInfo->wantMassQuery ? "true" : "false");
+            priority.setDefault(fmt("%d", cacheInfo->priority));
+        } else {
             try {
               BinaryCacheStore::init();
             } catch (UploadToIPFS &) {
-              throw Error(format("‘%s’ does not appear to be a binary cache") % cacheUri);
+              throw Error("‘%s’ does not appear to be a binary cache", cacheUri);
             }
-            diskCache->createCache(cacheUri, storeDir, wantMassQuery_, priority);
+            diskCache->createCache(cacheUri, storeDir, wantMassQuery, priority);
         }
     }
 
@@ -88,53 +91,52 @@ protected:
         /* TODO: perform ipfs ls instead instead of trying to fetch it */
         auto uri = constructIPFSRequest(path);
         try {
-            DownloadRequest request(uri);
-            request.showProgress = DownloadRequest::no;
+            FileTransferRequest request(uri);
+            //request.showProgress = FileTransferRequest::no;
             request.tries = 5;
             if (useIpfsGateway)
                 request.head = true;
-            getDownloader()->download(request);
+            getFileTransfer()->download(request);
             return true;
-        } catch (DownloadError & e) {
-            if (e.error == Downloader::NotFound)
+        } catch (FileTransferError & e) {
+            if (e.error == FileTransfer::NotFound)
                 return false;
             throw;
         }
     }
 
-    void upsertFile(const std::string & path, const std::string & data) override
+    void upsertFile(const std::string & path, const std::string & data, const std::string & mimeType) override
     {
         throw UploadToIPFS("uploading to an IPFS binary cache is not supported");
     }
 
     void getFile(const std::string & path,
-        std::function<void(std::shared_ptr<std::string>)> success,
-        std::function<void(std::exception_ptr exc)> failure) override
+        Callback<std::shared_ptr<std::string>> callback) noexcept override
     {
         /*
          * TODO: Try local mount first, best to share code with
          * LocalBinaryCacheStore
          */
         auto uri = constructIPFSRequest(path);
-        DownloadRequest request(uri);
-        request.showProgress = DownloadRequest::no;
+        FileTransferRequest request(uri);
+        //request.showProgress = FileTransferRequest::no;
         request.tries = 8;
 
-        getDownloader()->enqueueDownload(request,
-            [success](const DownloadResult & result) {
-                success(result.data);
-            },
-            [success, failure](std::exception_ptr exc) {
+        auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
+
+        getFileTransfer()->enqueueFileTransfer(request,
+            {[callbackPtr](std::future<FileTransferResult> result){
                 try {
-                    std::rethrow_exception(exc);
-                } catch (DownloadError & e) {
-                    if (e.error == Downloader::NotFound)
-                        return success(0);
-                    failure(exc);
+                    (*callbackPtr)(result.get().data);
+                } catch (FileTransferError & e) {
+                    if (e.error == FileTransfer::NotFound || e.error == FileTransfer::Forbidden)
+                        return (*callbackPtr)(std::shared_ptr<std::string>());
+                    callbackPtr->rethrow();
                 } catch (...) {
-                    failure(exc);
+                    callbackPtr->rethrow();
                 }
-            });
+            }}
+        );
     }
 
 };

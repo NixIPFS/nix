@@ -6,7 +6,7 @@ namespace nix {
 #define WORKER_MAGIC_1 0x6e697863
 #define WORKER_MAGIC_2 0x6478696f
 
-#define PROTOCOL_VERSION 0x112
+#define PROTOCOL_VERSION 0x115
 #define GET_PROTOCOL_MAJOR(x) ((x) & 0xff00)
 #define GET_PROTOCOL_MINOR(x) ((x) & 0x00ff)
 
@@ -36,7 +36,7 @@ typedef enum {
     wopClearFailedPaths = 25,
     wopQueryPathInfo = 26,
     wopImportPaths = 27, // obsolete
-    wopQueryDerivationOutputNames = 28,
+    wopQueryDerivationOutputNames = 28, // obsolete
     wopQueryPathFromHashPart = 29,
     wopQuerySubstitutablePathInfos = 30,
     wopQueryValidPaths = 31,
@@ -47,7 +47,8 @@ typedef enum {
     wopBuildDerivation = 36,
     wopAddSignatures = 37,
     wopNarFromPath = 38,
-    wopAddToStoreNar = 39
+    wopAddToStoreNar = 39,
+    wopQueryMissing = 40,
 } WorkerOp;
 
 
@@ -56,10 +57,17 @@ typedef enum {
 #define STDERR_WRITE 0x64617416 // data for sink
 #define STDERR_LAST  0x616c7473
 #define STDERR_ERROR 0x63787470
+#define STDERR_START_ACTIVITY 0x53545254
+#define STDERR_STOP_ACTIVITY  0x53544f50
+#define STDERR_RESULT         0x52534c54
 
 
-Path readStorePath(Store & store, Source & from);
-template<class T> T readStorePaths(Store & store, Source & from);
+class Store;
+struct Source;
+
+template<class T> T readStorePaths(const Store & store, Source & from);
+
+void writeStorePaths(const Store & store, Sink & out, const StorePathSet & paths);
 
 
 }

@@ -4,49 +4,35 @@ libstore_NAME = libnixstore
 
 libstore_DIR := $(d)
 
-libstore_SOURCES := \
-	$(d)/binary-cache-store.cc \
-	$(d)/build.cc \
-	$(d)/builtins.cc \
-	$(d)/crypto.cc \
-	$(d)/derivations.cc \
-	$(d)/download.cc \
-	$(d)/export-import.cc \
-	$(d)/gc.cc \
-	$(d)/globals.cc \
-	$(d)/http-binary-cache-store.cc \
-	$(d)/local-binary-cache-store.cc \
-	$(d)/local-fs-store.cc \
-	$(d)/local-store.cc \
-	$(d)/misc.cc \
-	$(d)/nar-accessor.cc \
-	$(d)/nar-info.cc \
-	$(d)/nar-info-disk-cache.cc \
-	$(d)/optimise-store.cc \
-	$(d)/pathlocks.cc \
-	$(d)/profiles.cc \
-	$(d)/references.cc \
-	$(d)/remote-fs-accessor.cc \
-	$(d)/remote-store.cc \
-	$(d)/sqlite.cc \
-	$(d)/ssh-store.cc \
-	$(d)/store-api.cc \
-	$(d)/ipfs-binary-cache-store.cc
+libstore_SOURCES := $(wildcard $(d)/*.cc $(d)/builtins/*.cc)
 
-libstore_LIBS = libutil libformat
+libstore_LIBS = libutil libnixrust
 
 libstore_LDFLAGS = $(SQLITE3_LIBS) -lbz2 $(LIBCURL_LIBS) $(SODIUM_LIBS) -pthread
+ifneq ($(OS), FreeBSD)
+ libstore_LDFLAGS += -ldl
+endif
+
+ifeq ($(OS), Darwin)
+libstore_FILES = sandbox-defaults.sb sandbox-minimal.sb sandbox-network.sb
+endif
+
+$(foreach file,$(libstore_FILES),$(eval $(call install-data-in,$(d)/$(file),$(datadir)/nix/sandbox)))
 
 ifeq ($(ENABLE_S3), 1)
-	libstore_LDFLAGS += -laws-cpp-sdk-s3 -laws-cpp-sdk-core
-	libstore_SOURCES += $(d)/s3-binary-cache-store.cc
+	libstore_LDFLAGS += -laws-cpp-sdk-transfer -laws-cpp-sdk-s3 -laws-cpp-sdk-core
 endif
 
 ifeq ($(OS), SunOS)
 	libstore_LDFLAGS += -lsocket
 endif
 
-libstore_CXXFLAGS = \
+ifeq ($(HAVE_SECCOMP), 1)
+	libstore_LDFLAGS += -lseccomp
+endif
+
+libstore_CXXFLAGS += \
+ -I src/libutil -I src/libstore \
  -DNIX_PREFIX=\"$(prefix)\" \
  -DNIX_STORE_DIR=\"$(storedir)\" \
  -DNIX_DATA_DIR=\"$(datadir)\" \
@@ -55,14 +41,23 @@ libstore_CXXFLAGS = \
  -DNIX_CONF_DIR=\"$(sysconfdir)/nix\" \
  -DNIX_LIBEXEC_DIR=\"$(libexecdir)\" \
  -DNIX_BIN_DIR=\"$(bindir)\" \
- -DBASH_PATH="\"$(bash)\""
+ -DNIX_MAN_DIR=\"$(mandir)\" \
+ -DLSOF=\"$(lsof)\"
 
-$(d)/local-store.cc: $(d)/schema.sql.hh
+ifneq ($(sandbox_shell),)
+libstore_CXXFLAGS += -DSANDBOX_SHELL="\"$(sandbox_shell)\""
+endif
 
-%.sql.hh: %.sql
-	$(trace-gen) sed -e 's/"/\\"/g' -e 's/\(.*\)/"\1\\n"/' < $< > $@ || (rm $@ && exit 1)
+$(d)/local-store.cc: $(d)/schema.sql.gen.hh
 
-clean-files += $(d)/schema.sql.hh
+$(d)/build.cc:
+
+%.gen.hh: %
+	@echo 'R"foo(' >> $@.tmp
+	$(trace-gen) cat $< >> $@.tmp
+	@echo ')foo"' >> $@.tmp
+	@mv $@.tmp $@
+
+clean-files += $(d)/schema.sql.gen.hh
 
 $(eval $(call install-file-in, $(d)/nix-store.pc, $(prefix)/lib/pkgconfig, 0644))
-$(eval $(call install-file-in, $(d)/sandbox-defaults.sb, $(datadir)/nix, 0644))

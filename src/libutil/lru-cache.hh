@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cassert>
 #include <map>
 #include <list>
+#include <optional>
 
 namespace nix {
 
@@ -11,7 +13,7 @@ class LRUCache
 {
 private:
 
-    size_t maxSize;
+    size_t capacity;
 
     // Stupid wrapper to get around circular dependency between Data
     // and LRU.
@@ -27,14 +29,16 @@ private:
 
 public:
 
-    LRUCache(size_t maxSize) : maxSize(maxSize) { }
+    LRUCache(size_t capacity) : capacity(capacity) { }
 
     /* Insert or upsert an item in the cache. */
     void upsert(const Key & key, const Value & value)
     {
+        if (capacity == 0) return;
+
         erase(key);
 
-        if (data.size() >= maxSize) {
+        if (data.size() >= capacity) {
             /* Retire the oldest item. */
             auto oldest = lru.begin();
             data.erase(*oldest);
@@ -61,18 +65,17 @@ public:
 
     /* Look up an item in the cache. If it exists, it becomes the most
        recently used item. */
-    // FIXME: use boost::optional?
-    Value * get(const Key & key)
+    std::optional<Value> get(const Key & key)
     {
         auto i = data.find(key);
-        if (i == data.end()) return 0;
+        if (i == data.end()) return {};
 
         /* Move this item to the back of the LRU list. */
         lru.erase(i->second.first.it);
         auto j = lru.insert(lru.end(), i);
         i->second.first.it = j;
 
-        return &i->second.second;
+        return i->second.second;
     }
 
     size_t size()

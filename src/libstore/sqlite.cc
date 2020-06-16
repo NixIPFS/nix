@@ -3,43 +3,38 @@
 
 #include <sqlite3.h>
 
+#include <atomic>
+
 namespace nix {
 
-[[noreturn]] void throwSQLiteError(sqlite3 * db, const format & f)
+[[noreturn]] void throwSQLiteError(sqlite3 * db, const FormatOrString & fs)
 {
     int err = sqlite3_errcode(db);
+    int exterr = sqlite3_extended_errcode(db);
+
+    auto path = sqlite3_db_filename(db, nullptr);
+    if (!path) path = "(in-memory)";
+
     if (err == SQLITE_BUSY || err == SQLITE_PROTOCOL) {
-        if (err == SQLITE_PROTOCOL)
-            printError("warning: SQLite database is busy (SQLITE_PROTOCOL)");
-        else {
-            static bool warned = false;
-            if (!warned) {
-                printError("warning: SQLite database is busy");
-                warned = true;
-            }
-        }
-        /* Sleep for a while since retrying the transaction right away
-           is likely to fail again. */
-        checkInterrupt();
-#if HAVE_NANOSLEEP
-        struct timespec t;
-        t.tv_sec = 0;
-        t.tv_nsec = (random() % 100) * 1000 * 1000; /* <= 0.1s */
-        nanosleep(&t, 0);
-#else
-        sleep(1);
-#endif
-        throw SQLiteBusy(format("%1%: %2%") % f.str() % sqlite3_errmsg(db));
+        throw SQLiteBusy(
+            err == SQLITE_PROTOCOL
+            ? fmt("SQLite database '%s' is busy (SQLITE_PROTOCOL)", path)
+            : fmt("SQLite database '%s' is busy", path));
     }
     else
-        throw SQLiteError(format("%1%: %2%") % f.str() % sqlite3_errmsg(db));
+        throw SQLiteError("%s: %s (in '%s')", fs.s, sqlite3_errstr(exterr), path);
 }
 
-SQLite::SQLite(const Path & path)
+SQLite::SQLite(const Path & path, bool create)
 {
     if (sqlite3_open_v2(path.c_str(), &db,
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0) != SQLITE_OK)
-        throw Error(format("cannot open SQLite database ‘%s’") % path);
+            SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0), 0) != SQLITE_OK)
+        throw Error("cannot open SQLite database '%s'", path);
+
+    if (sqlite3_busy_timeout(db, 60 * 60 * 1000) != SQLITE_OK)
+        throwSQLiteError(db, "setting timeout");
+
+    exec("pragma foreign_keys = 1");
 }
 
 SQLite::~SQLite()
@@ -52,26 +47,35 @@ SQLite::~SQLite()
     }
 }
 
-void SQLite::exec(const std::string & stmt)
+void SQLite::isCache()
 {
-    if (sqlite3_exec(db, stmt.c_str(), 0, 0, 0) != SQLITE_OK)
-        throwSQLiteError(db, format("executing SQLite statement ‘%s’") % stmt);
+    exec("pragma synchronous = off");
+    exec("pragma main.journal_mode = truncate");
 }
 
-void SQLiteStmt::create(sqlite3 * db, const string & s)
+void SQLite::exec(const std::string & stmt)
+{
+    retrySQLite<void>([&]() {
+        if (sqlite3_exec(db, stmt.c_str(), 0, 0, 0) != SQLITE_OK)
+            throwSQLiteError(db, format("executing SQLite statement '%s'") % stmt);
+    });
+}
+
+void SQLiteStmt::create(sqlite3 * db, const string & sql)
 {
     checkInterrupt();
     assert(!stmt);
-    if (sqlite3_prepare_v2(db, s.c_str(), -1, &stmt, 0) != SQLITE_OK)
-        throwSQLiteError(db, "creating statement");
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK)
+        throwSQLiteError(db, fmt("creating statement '%s'", sql));
     this->db = db;
+    this->sql = sql;
 }
 
 SQLiteStmt::~SQLiteStmt()
 {
     try {
         if (stmt && sqlite3_finalize(stmt) != SQLITE_OK)
-            throwSQLiteError(db, "finalizing statement");
+            throwSQLiteError(db, fmt("finalizing statement '%s'", sql));
     } catch (...) {
         ignoreException();
     }
@@ -95,6 +99,16 @@ SQLiteStmt::Use & SQLiteStmt::Use::operator () (const std::string & value, bool 
 {
     if (notNull) {
         if (sqlite3_bind_text(stmt, curArg++, value.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK)
+            throwSQLiteError(stmt.db, "binding argument");
+    } else
+        bind();
+    return *this;
+}
+
+SQLiteStmt::Use & SQLiteStmt::Use::operator () (const unsigned char * data, size_t len, bool notNull)
+{
+    if (notNull) {
+        if (sqlite3_bind_blob(stmt, curArg++, data, len, SQLITE_TRANSIENT) != SQLITE_OK)
             throwSQLiteError(stmt.db, "binding argument");
     } else
         bind();
@@ -128,14 +142,14 @@ void SQLiteStmt::Use::exec()
     int r = step();
     assert(r != SQLITE_ROW);
     if (r != SQLITE_DONE)
-        throwSQLiteError(stmt.db, "executing SQLite statement");
+        throwSQLiteError(stmt.db, fmt("executing SQLite statement '%s'", stmt.sql));
 }
 
 bool SQLiteStmt::Use::next()
 {
     int r = step();
     if (r != SQLITE_DONE && r != SQLITE_ROW)
-        throwSQLiteError(stmt.db, "executing SQLite query");
+        throwSQLiteError(stmt.db, fmt("executing SQLite query '%s'", stmt.sql));
     return r == SQLITE_ROW;
 }
 
@@ -180,6 +194,29 @@ SQLiteTxn::~SQLiteTxn()
     } catch (...) {
         ignoreException();
     }
+}
+
+void handleSQLiteBusy(const SQLiteBusy & e)
+{
+    static std::atomic<time_t> lastWarned{0};
+
+    time_t now = time(0);
+
+    if (now > lastWarned + 10) {
+        lastWarned = now;
+        logWarning({
+            .name = "Sqlite busy",
+            .hint = hintfmt(e.what())
+        });
+    }
+
+    /* Sleep for a while since retrying the transaction right away
+       is likely to fail again. */
+    checkInterrupt();
+    struct timespec t;
+    t.tv_sec = 0;
+    t.tv_nsec = (random() % 100) * 1000 * 1000; /* <= 0.1s */
+    nanosleep(&t, 0);
 }
 
 }

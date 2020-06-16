@@ -40,7 +40,7 @@ Generations findGenerations(Path profile, int & curGen)
     Generations gens;
 
     Path profileDir = dirOf(profile);
-    string profileName = baseNameOf(profile);
+    auto profileName = std::string(baseNameOf(profile));
 
     for (auto & i : readDirectory(profileDir)) {
         int n;
@@ -50,7 +50,7 @@ Generations findGenerations(Path profile, int & curGen)
             gen.number = n;
             struct stat st;
             if (lstat(gen.path.c_str(), &st) != 0)
-                throw SysError(format("statting ‘%1%’") % gen.path);
+                throw SysError("statting '%1%'", gen.path);
             gen.creationTime = st.st_mtime;
             gens.push_back(gen);
         }
@@ -108,7 +108,7 @@ Path createGeneration(ref<LocalFSStore> store, Path profile, Path outPath)
        user environment etc. we've just built. */
     Path generation;
     makeName(profile, num + 1, generation);
-    store->addPermRoot(outPath, generation, false, true);
+    store->addPermRoot(store->parseStorePath(outPath), generation, false, true);
 
     return generation;
 }
@@ -117,7 +117,7 @@ Path createGeneration(ref<LocalFSStore> store, Path profile, Path outPath)
 static void removeFile(const Path & path)
 {
     if (remove(path.c_str()) == -1)
-        throw SysError(format("cannot unlink ‘%1%’") % path);
+        throw SysError("cannot unlink '%1%'", path);
 }
 
 
@@ -149,7 +149,7 @@ void deleteGenerations(const Path & profile, const std::set<unsigned int> & gens
     Generations gens = findGenerations(profile, curGen);
 
     if (gensToDelete.find(curGen) != gensToDelete.end())
-        throw Error(format("cannot delete current generation of profile %1%’") % profile);
+        throw Error("cannot delete current generation of profile %1%'", profile);
 
     for (auto & i : gens) {
         if (gensToDelete.find(i.number) == gensToDelete.end()) continue;
@@ -157,6 +157,29 @@ void deleteGenerations(const Path & profile, const std::set<unsigned int> & gens
     }
 }
 
+void deleteGenerationsGreaterThan(const Path & profile, int max, bool dryRun)
+{
+    PathLocks lock;
+    lockProfile(lock, profile);
+
+    int curGen;
+    bool fromCurGen = false;
+    Generations gens = findGenerations(profile, curGen);
+    for (auto i = gens.rbegin(); i != gens.rend(); ++i) {
+        if (i->number == curGen) {
+            fromCurGen = true;
+            max--;
+            continue;
+        }
+        if (fromCurGen) {
+            if (max) {
+                max--;
+                continue;
+            }
+            deleteGeneration2(profile, i->number, dryRun);
+        }
+    }
+}
 
 void deleteOldGenerations(const Path & profile, bool dryRun)
 {
@@ -203,7 +226,7 @@ void deleteGenerationsOlderThan(const Path & profile, const string & timeSpec, b
     int days;
 
     if (!string2Int(strDays, days) || days < 1)
-        throw Error(format("invalid number of days specifier ‘%1%’") % timeSpec);
+        throw Error("invalid number of days specifier '%1%'", timeSpec);
 
     time_t oldTime = curTime - days * 24 * 3600;
 
@@ -222,7 +245,7 @@ void switchLink(Path link, Path target)
 
 void lockProfile(PathLocks & lock, const Path & profile)
 {
-    lock.lockPaths({profile}, (format("waiting for lock on profile ‘%1%’") % profile).str());
+    lock.lockPaths({profile}, (format("waiting for lock on profile '%1%'") % profile).str());
     lock.setDeletion(true);
 }
 
@@ -230,6 +253,24 @@ void lockProfile(PathLocks & lock, const Path & profile)
 string optimisticLockProfile(const Path & profile)
 {
     return pathExists(profile) ? readLink(profile) : "";
+}
+
+
+Path getDefaultProfile()
+{
+    Path profileLink = getHome() + "/.nix-profile";
+    try {
+        if (!pathExists(profileLink)) {
+            replaceSymlink(
+                getuid() == 0
+                ? settings.nixStateDir + "/profiles/default"
+                : fmt("%s/profiles/per-user/%s/profile", settings.nixStateDir, getUserName()),
+                profileLink);
+        }
+        return absPath(readLink(profileLink), dirOf(profileLink));
+    } catch (Error &) {
+        return profileLink;
+    }
 }
 
 

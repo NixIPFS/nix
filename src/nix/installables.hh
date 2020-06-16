@@ -1,48 +1,45 @@
 #pragma once
 
-#include "args.hh"
+#include "util.hh"
+#include "path.hh"
+#include "eval.hh"
+
+#include <optional>
 
 namespace nix {
 
-struct UserEnvElem
+struct Buildable
 {
-    Strings attrPath;
-
-    // FIXME: should use boost::variant or so.
-    bool isDrv;
-
-    // Derivation case:
-    Path drvPath;
-    StringSet outputNames;
-
-    // Non-derivation case:
-    PathSet outPaths;
+    std::optional<StorePath> drvPath;
+    std::map<std::string, StorePath> outputs;
 };
 
-typedef std::vector<UserEnvElem> UserEnvElems;
+typedef std::vector<Buildable> Buildables;
 
-struct Value;
-class EvalState;
-
-struct MixInstallables : virtual Args
+struct Installable
 {
-    Strings installables;
-    Path file;
+    virtual ~Installable() { }
 
-    MixInstallables()
+    virtual std::string what() = 0;
+
+    virtual Buildables toBuildables()
     {
-        mkFlag('f', "file", "file", "evaluate FILE rather than the default", &file);
-        expectArgs("installables", &installables);
+        throw Error("argument '%s' cannot be built", what());
     }
 
-    UserEnvElems evalInstallables(ref<Store> store);
+    Buildable toBuildable();
 
-    /* Return a value representing the Nix expression from which we
-       are installing. This is either the file specified by ‘--file’,
-       or an attribute set constructed from $NIX_PATH, e.g. ‘{ nixpkgs
-       = import ...; bla = import ...; }’. */
-    Value * buildSourceExpr(EvalState & state);
+    virtual std::pair<Value *, Pos> toValue(EvalState & state)
+    {
+        throw Error("argument '%s' cannot be evaluated", what());
+    }
 
+    /* Return a value only if this installable is a store path or a
+       symlink to it. */
+    virtual std::optional<StorePath> getStorePath()
+    {
+        return {};
+    }
 };
 
 }

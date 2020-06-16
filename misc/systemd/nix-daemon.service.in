@@ -7,4 +7,6 @@ ConditionPathIsReadWrite=@localstatedir@/nix/daemon-socket
 [Service]
 ExecStart=@@bindir@/nix-daemon nix-daemon --daemon
 KillMode=process
-Environment=XDG_CACHE_HOME=/root/.cache
+
+[Install]
+WantedBy=multi-user.target

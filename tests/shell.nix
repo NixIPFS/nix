@@ -1,8 +1,8 @@
-{ }:
+{ inNixShell ? false }:
 
 with import ./config.nix;
 
-rec {
+let pkgs = rec {
   setupSh = builtins.toFile "setup" ''
     export VAR_FROM_STDENV_SETUP=foo
     for pkg in $buildInputs; do
@@ -22,6 +22,7 @@ rec {
     name = "shellDrv";
     builder = "/does/not/exist";
     VAR_FROM_NIX = "bar";
+    TEST_inNixShell = if inNixShell then "true" else "false";
     inherit stdenv;
   };
 
@@ -34,6 +35,7 @@ rec {
     mkdir -p $out/bin
     echo 'echo foo' > $out/bin/foo
     chmod a+rx $out/bin/foo
+    ln -s ${shell} $out/bin/bash
   '';
 
   bar = runCommand "bar" {} ''
@@ -43,4 +45,13 @@ rec {
   '';
 
   bash = shell;
-}
+
+  # ruby "interpreter" that outputs "$@"
+  ruby = runCommand "ruby" {} ''
+    mkdir -p $out/bin
+    echo 'printf -- "$*"' > $out/bin/ruby
+    chmod a+rx $out/bin/ruby
+  '';
+
+  inherit pkgs;
+}; in pkgs

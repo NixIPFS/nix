@@ -1,29 +1,15 @@
 { useClang ? false }:
 
-with import <nixpkgs> {};
+with import (builtins.fetchTarball https://github.com/NixOS/nixpkgs/archive/nixos-20.03-small.tar.gz) {};
+
+with import ./release-common.nix { inherit pkgs; };
 
 (if useClang then clangStdenv else stdenv).mkDerivation {
   name = "nix";
 
-  buildInputs =
-    [ curl bison flex perl libxml2 libxslt bzip2 xz
-      pkgconfig sqlite libsodium boehmgc
-      docbook5 docbook5_xsl
-      autoconf-archive
-      (aws-sdk-cpp.override {
-        apis = ["s3"];
-        customMemoryManagement = false;
-      })
-      autoreconfHook
-      perlPackages.DBDSQLite
-    ];
+  buildInputs = buildDeps ++ propagatedDeps ++ perlDeps ++ [ pkgs.rustfmt ];
 
-  configureFlags =
-    [ "--disable-init-state"
-      "--enable-gc"
-      "--with-dbi=${perlPackages.DBI}/${perl.libPrefix}"
-      "--with-dbd-sqlite=${perlPackages.DBDSQLite}/${perl.libPrefix}"
-    ];
+  inherit configureFlags;
 
   enableParallelBuilding = true;
 
@@ -31,6 +17,9 @@ with import <nixpkgs> {};
 
   shellHook =
     ''
-      configureFlags+=" --prefix=$(pwd)/inst"
+      export prefix=$(pwd)/inst
+      configureFlags+=" --prefix=$prefix"
+      PKG_CONFIG_PATH=$prefix/lib/pkgconfig:$PKG_CONFIG_PATH
+      PATH=$prefix/bin:$PATH
     '';
 }

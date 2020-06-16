@@ -4,6 +4,7 @@
 #include "symbol-table.hh"
 
 #include <algorithm>
+#include <optional>
 
 namespace nix {
 
@@ -63,6 +64,26 @@ public:
         return end();
     }
 
+    Attr * get(const Symbol & name)
+    {
+        Attr key(name, 0);
+        iterator i = std::lower_bound(begin(), end(), key);
+        if (i != end() && i->name == name) return &*i;
+        return nullptr;
+    }
+
+    Attr & need(const Symbol & name, const Pos & pos = noPos)
+    {
+        auto a = get(name);
+        if (!a)
+            throw Error({
+                .hint = hintfmt("attribute '%s' missing", name),
+                .nixCode = NixCode { .errPos = pos }
+            });
+
+        return *a;
+    }
+
     iterator begin() { return &attrs[0]; }
     iterator end() { return &attrs[size_]; }
 
@@ -74,6 +95,19 @@ public:
     void sort();
 
     size_t capacity() { return capacity_; }
+
+    /* Returns the attributes in lexicographically sorted order. */
+    std::vector<const Attr *> lexicographicOrder() const
+    {
+        std::vector<const Attr *> res;
+        res.reserve(size_);
+        for (size_t n = 0; n < size_; n++)
+            res.emplace_back(&attrs[n]);
+        std::sort(res.begin(), res.end(), [](const Attr * a, const Attr * b) {
+            return (const string &) a->name < (const string &) b->name;
+        });
+        return res;
+    }
 
     friend class EvalState;
 };

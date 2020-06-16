@@ -3,6 +3,7 @@
 #include "store-api.hh"
 #include "sync.hh"
 #include "thread-pool.hh"
+#include "references.hh"
 
 #include <atomic>
 
@@ -13,20 +14,20 @@ struct CmdVerify : StorePathsCommand
     bool noContents = false;
     bool noTrust = false;
     Strings substituterUris;
-    size_t sigsNeeded;
+    size_t sigsNeeded = 0;
 
     CmdVerify()
     {
         mkFlag(0, "no-contents", "do not verify the contents of each store path", &noContents);
         mkFlag(0, "no-trust", "do not verify whether each store path is trusted", &noTrust);
-        mkFlag('s', "substituter", {"store-uri"}, "use signatures from specified store", 1,
-            [&](Strings ss) { substituterUris.push_back(ss.front()); });
+        addFlag({
+            .longName = "substituter",
+            .shortName = 's',
+            .description = "use signatures from specified store",
+            .labels = {"store-uri"},
+            .handler = {[&](std::string s) { substituterUris.push_back(s); }}
+        });
         mkIntFlag('n', "sigs-needed", "require that each path has at least N valid signatures", &sigsNeeded);
-    }
-
-    std::string name() override
-    {
-        return "verify";
     }
 
     std::string description() override
@@ -48,7 +49,9 @@ struct CmdVerify : StorePathsCommand
         };
     }
 
-    void run(ref<Store> store, Paths storePaths) override
+    Category category() override { return catSecondary; }
+
+    void run(ref<Store> store, StorePaths storePaths) override
     {
         std::vector<ref<Store>> substituters;
         for (auto & s : substituterUris)
@@ -56,16 +59,17 @@ struct CmdVerify : StorePathsCommand
 
         auto publicKeys = getDefaultPublicKeys();
 
+        Activity act(*logger, actVerifyPaths);
+
         std::atomic<size_t> done{0};
         std::atomic<size_t> untrusted{0};
         std::atomic<size_t> corrupted{0};
         std::atomic<size_t> failed{0};
+        std::atomic<size_t> active{0};
 
-        std::string doneLabel("paths checked");
-        std::string untrustedLabel("untrusted");
-        std::string corruptedLabel("corrupted");
-        std::string failedLabel("failed");
-        logger->setExpected(doneLabel, storePaths.size());
+        auto update = [&]() {
+            act.progress(done, storePaths.size(), active, failed);
+        };
 
         ThreadPool pool;
 
@@ -73,25 +77,37 @@ struct CmdVerify : StorePathsCommand
             try {
                 checkInterrupt();
 
-                Activity act(*logger, lvlInfo, format("checking ‘%s’") % storePath);
+                Activity act2(*logger, lvlInfo, actUnknown, fmt("checking '%s'", storePath));
 
-                auto info = store->queryPathInfo(storePath);
+                MaintainCount<std::atomic<size_t>> mcActive(active);
+                update();
+
+                auto info = store->queryPathInfo(store->parseStorePath(storePath));
 
                 if (!noContents) {
 
-                    HashSink sink(info->narHash.type);
-                    store->narFromPath(info->path, sink);
+                    std::unique_ptr<AbstractHashSink> hashSink;
+                    if (info->ca == "")
+                        hashSink = std::make_unique<HashSink>(info->narHash.type);
+                    else
+                        hashSink = std::make_unique<HashModuloSink>(info->narHash.type, storePathToHash(store->printStorePath(info->path)));
 
-                    auto hash = sink.finish();
+                    store->narFromPath(info->path, *hashSink);
+
+                    auto hash = hashSink->finish();
 
                     if (hash.first != info->narHash) {
-                        logger->incProgress(corruptedLabel);
-                        corrupted = 1;
-                        printError(
-                            format("path ‘%s’ was modified! expected hash ‘%s’, got ‘%s’")
-                            % info->path % printHash(info->narHash) % printHash(hash.first));
+                        corrupted++;
+                        act2.result(resCorruptedPath, store->printStorePath(info->path));
+                        logError({
+                            .name = "Hash error - path modified",
+                            .hint = hintfmt(
+                                "path '%s' was modified! expected hash '%s', got '%s'",
+                                store->printStorePath(info->path),
+                                info->narHash.to_string(Base32, true),
+                                hash.first.to_string(Base32, true))
+                        });
                     }
-
                 }
 
                 if (!noTrust) {
@@ -104,14 +120,13 @@ struct CmdVerify : StorePathsCommand
                     else {
 
                         StringSet sigsSeen;
-                        size_t actualSigsNeeded = sigsNeeded ? sigsNeeded : 1;
+                        size_t actualSigsNeeded = std::max(sigsNeeded, (size_t) 1);
                         size_t validSigs = 0;
 
                         auto doSigs = [&](StringSet sigs) {
                             for (auto sig : sigs) {
-                                if (sigsSeen.count(sig)) continue;
-                                sigsSeen.insert(sig);
-                                if (info->checkSignature(publicKeys, sig))
+                                if (!sigsSeen.insert(sig).second) continue;
+                                if (validSigs < ValidPathInfo::maxSigs && info->checkSignature(*store, publicKeys, sig))
                                     validSigs++;
                             }
                         };
@@ -128,7 +143,7 @@ struct CmdVerify : StorePathsCommand
                                 doSigs(info2->sigs);
                             } catch (InvalidPath &) {
                             } catch (Error & e) {
-                                printError(format(ANSI_RED "error:" ANSI_NORMAL " %s") % e.what());
+                                logError(e.info());
                             }
                         }
 
@@ -137,30 +152,32 @@ struct CmdVerify : StorePathsCommand
                     }
 
                     if (!good) {
-                        logger->incProgress(untrustedLabel);
                         untrusted++;
-                        printError(format("path ‘%s’ is untrusted") % info->path);
+                        act2.result(resUntrustedPath, store->printStorePath(info->path));
+                        logError({
+                            .name = "Untrusted path",
+                            .hint = hintfmt("path '%s' is untrusted",
+                                store->printStorePath(info->path))
+                        });
+
                     }
 
                 }
 
-                logger->incProgress(doneLabel);
                 done++;
 
             } catch (Error & e) {
-                printError(format(ANSI_RED "error:" ANSI_NORMAL " %s") % e.what());
-                logger->incProgress(failedLabel);
+                logError(e.info());
                 failed++;
             }
+
+            update();
         };
 
         for (auto & storePath : storePaths)
-            pool.enqueue(std::bind(doPath, storePath));
+            pool.enqueue(std::bind(doPath, store->printStorePath(storePath)));
 
         pool.process();
-
-        printInfo(format("%d paths checked, %d untrusted, %d corrupted, %d failed")
-            % done % untrusted % corrupted % failed);
 
         throw Exit(
             (corrupted ? 1 : 0) |
@@ -169,4 +186,4 @@ struct CmdVerify : StorePathsCommand
     }
 };
 
-static RegisterCommand r1(make_ref<CmdVerify>());
+static auto r1 = registerCommand<CmdVerify>("verify");

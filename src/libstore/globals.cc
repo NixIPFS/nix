@@ -1,12 +1,13 @@
-#include "config.h"
-
 #include "globals.hh"
 #include "util.hh"
 #include "archive.hh"
+#include "args.hh"
 
-#include <map>
 #include <algorithm>
-#include <unistd.h>
+#include <map>
+#include <thread>
+#include <dlfcn.h>
+#include <sys/utsname.h>
 
 
 namespace nix {
@@ -19,252 +20,208 @@ namespace nix {
    must be deleted and recreated on startup.) */
 #define DEFAULT_SOCKET_PATH "/daemon-socket/socket"
 
-
 Settings settings;
 
+static GlobalConfig::Register r1(&settings);
 
 Settings::Settings()
+    : nixPrefix(NIX_PREFIX)
+    , nixStore(canonPath(getEnv("NIX_STORE_DIR").value_or(getEnv("NIX_STORE").value_or(NIX_STORE_DIR))))
+    , nixDataDir(canonPath(getEnv("NIX_DATA_DIR").value_or(NIX_DATA_DIR)))
+    , nixLogDir(canonPath(getEnv("NIX_LOG_DIR").value_or(NIX_LOG_DIR)))
+    , nixStateDir(canonPath(getEnv("NIX_STATE_DIR").value_or(NIX_STATE_DIR)))
+    , nixConfDir(canonPath(getEnv("NIX_CONF_DIR").value_or(NIX_CONF_DIR)))
+    , nixUserConfFiles(getUserConfigFiles())
+    , nixLibexecDir(canonPath(getEnv("NIX_LIBEXEC_DIR").value_or(NIX_LIBEXEC_DIR)))
+    , nixBinDir(canonPath(getEnv("NIX_BIN_DIR").value_or(NIX_BIN_DIR)))
+    , nixManDir(canonPath(NIX_MAN_DIR))
+    , nixDaemonSocketFile(canonPath(nixStateDir + DEFAULT_SOCKET_PATH))
 {
-    keepFailed = false;
-    keepGoing = false;
-    tryFallback = false;
-    maxBuildJobs = 1;
-    buildCores = 1;
-#ifdef _SC_NPROCESSORS_ONLN
-    long res = sysconf(_SC_NPROCESSORS_ONLN);
-    if (res > 0) buildCores = res;
-#endif
-    readOnlyMode = false;
-    thisSystem = SYSTEM;
-    maxSilentTime = 0;
-    buildTimeout = 0;
-    useBuildHook = true;
-    reservedSize = 8 * 1024 * 1024;
-    fsyncMetadata = true;
-    useSQLiteWAL = true;
-    syncBeforeRegistering = false;
-    useSubstitutes = true;
     buildUsersGroup = getuid() == 0 ? "nixbld" : "";
-    useSshSubstituter = true;
-    impersonateLinux26 = false;
-    keepLog = true;
-    compressLog = true;
-    maxLogSize = 0;
-    pollInterval = 5;
-    checkRootReachability = false;
-    gcKeepOutputs = false;
-    gcKeepDerivations = true;
-    autoOptimiseStore = false;
-    envKeepDerivations = false;
-    lockCPU = getEnv("NIX_AFFINITY_HACK", "1") == "1";
-    showTrace = false;
-    enableImportNative = false;
-}
+    lockCPU = getEnv("NIX_AFFINITY_HACK") == "1";
+
+    caFile = getEnv("NIX_SSL_CERT_FILE").value_or(getEnv("SSL_CERT_FILE").value_or(""));
+    if (caFile == "") {
+        for (auto & fn : {"/etc/ssl/certs/ca-certificates.crt", "/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt"})
+            if (pathExists(fn)) {
+                caFile = fn;
+                break;
+            }
+    }
+
+    /* Backwards compatibility. */
+    auto s = getEnv("NIX_REMOTE_SYSTEMS");
+    if (s) {
+        Strings ss;
+        for (auto & p : tokenizeString<Strings>(*s, ":"))
+            ss.push_back("@" + p);
+        builders = concatStringsSep(" ", ss);
+    }
+
+#if defined(__linux__) && defined(SANDBOX_SHELL)
+    sandboxPaths = tokenizeString<StringSet>("/bin/sh=" SANDBOX_SHELL);
+#endif
 
 
-void Settings::processEnvironment()
-{
-    nixPrefix = NIX_PREFIX;
-    nixStore = canonPath(getEnv("NIX_STORE_DIR", getEnv("NIX_STORE", NIX_STORE_DIR)));
-    nixDataDir = canonPath(getEnv("NIX_DATA_DIR", NIX_DATA_DIR));
-    nixLogDir = canonPath(getEnv("NIX_LOG_DIR", NIX_LOG_DIR));
-    nixStateDir = canonPath(getEnv("NIX_STATE_DIR", NIX_STATE_DIR));
-    nixConfDir = canonPath(getEnv("NIX_CONF_DIR", NIX_CONF_DIR));
-    nixLibexecDir = canonPath(getEnv("NIX_LIBEXEC_DIR", NIX_LIBEXEC_DIR));
-    nixBinDir = canonPath(getEnv("NIX_BIN_DIR", NIX_BIN_DIR));
-    nixDaemonSocketFile = canonPath(nixStateDir + DEFAULT_SOCKET_PATH);
-
-    // should be set with the other config options, but depends on nixLibexecDir
-#ifdef __APPLE__
-    preBuildHook = nixLibexecDir + "/nix/resolve-system-dependencies";
+/* chroot-like behavior from Apple's sandbox */
+#if __APPLE__
+    sandboxPaths = tokenizeString<StringSet>("/System/Library/Frameworks /System/Library/PrivateFrameworks /bin/sh /bin/bash /private/tmp /private/var/tmp /usr/lib");
+    allowedImpureHostPrefixes = tokenizeString<StringSet>("/System/Library /usr/lib /dev /bin/sh");
 #endif
 }
 
-
-void Settings::loadConfFile()
+void loadConfFile()
 {
-    Path settingsFile = (format("%1%/%2%") % nixConfDir % "nix.conf").str();
-    if (!pathExists(settingsFile)) return;
-    string contents = readFile(settingsFile);
+    globalConfig.applyConfigFile(settings.nixConfDir + "/nix.conf");
 
-    unsigned int pos = 0;
+    /* We only want to send overrides to the daemon, i.e. stuff from
+       ~/.nix/nix.conf or the command line. */
+    globalConfig.resetOverriden();
 
-    while (pos < contents.size()) {
-        string line;
-        while (pos < contents.size() && contents[pos] != '\n')
-            line += contents[pos++];
-        pos++;
-
-        string::size_type hash = line.find('#');
-        if (hash != string::npos)
-            line = string(line, 0, hash);
-
-        vector<string> tokens = tokenizeString<vector<string> >(line);
-        if (tokens.empty()) continue;
-
-        if (tokens.size() < 2 || tokens[1] != "=")
-            throw Error(format("illegal configuration line ‘%1%’ in ‘%2%’") % line % settingsFile);
-
-        string name = tokens[0];
-
-        vector<string>::iterator i = tokens.begin();
-        advance(i, 2);
-        settings[name] = concatStringsSep(" ", Strings(i, tokens.end())); // FIXME: slow
-    };
-}
-
-
-void Settings::set(const string & name, const string & value)
-{
-    settings[name] = value;
-    overrides[name] = value;
-}
-
-
-string Settings::get(const string & name, const string & def)
-{
-    auto i = settings.find(name);
-    if (i == settings.end()) return def;
-    return i->second;
-}
-
-
-Strings Settings::get(const string & name, const Strings & def)
-{
-    auto i = settings.find(name);
-    if (i == settings.end()) return def;
-    return tokenizeString<Strings>(i->second);
-}
-
-
-bool Settings::get(const string & name, bool def)
-{
-    bool res = def;
-    _get(res, name);
-    return res;
-}
-
-
-int Settings::get(const string & name, int def)
-{
-    int res = def;
-    _get(res, name);
-    return res;
-}
-
-
-void Settings::update()
-{
-    _get(tryFallback, "build-fallback");
-    _get(maxBuildJobs, "build-max-jobs");
-    _get(buildCores, "build-cores");
-    _get(thisSystem, "system");
-    _get(maxSilentTime, "build-max-silent-time");
-    _get(buildTimeout, "build-timeout");
-    _get(reservedSize, "gc-reserved-space");
-    _get(fsyncMetadata, "fsync-metadata");
-    _get(useSQLiteWAL, "use-sqlite-wal");
-    _get(syncBeforeRegistering, "sync-before-registering");
-    _get(useSubstitutes, "build-use-substitutes");
-    _get(buildUsersGroup, "build-users-group");
-    _get(impersonateLinux26, "build-impersonate-linux-26");
-    _get(keepLog, "build-keep-log");
-    _get(compressLog, "build-compress-log");
-    _get(maxLogSize, "build-max-log-size");
-    _get(pollInterval, "build-poll-interval");
-    _get(checkRootReachability, "gc-check-reachability");
-    _get(gcKeepOutputs, "gc-keep-outputs");
-    _get(gcKeepDerivations, "gc-keep-derivations");
-    _get(autoOptimiseStore, "auto-optimise-store");
-    _get(envKeepDerivations, "env-keep-derivations");
-    _get(sshSubstituterHosts, "ssh-substituter-hosts");
-    _get(useSshSubstituter, "use-ssh-substituter");
-    _get(logServers, "log-servers");
-    _get(enableImportNative, "allow-unsafe-native-code-during-evaluation");
-    _get(useCaseHack, "use-case-hack");
-    _get(preBuildHook, "pre-build-hook");
-    _get(keepGoing, "keep-going");
-    _get(keepFailed, "keep-failed");
-}
-
-
-void Settings::_get(string & res, const string & name)
-{
-    SettingsMap::iterator i = settings.find(name);
-    if (i == settings.end()) return;
-    res = i->second;
-}
-
-
-void Settings::_get(bool & res, const string & name)
-{
-    SettingsMap::iterator i = settings.find(name);
-    if (i == settings.end()) return;
-    if (i->second == "true") res = true;
-    else if (i->second == "false") res = false;
-    else throw Error(format("configuration option ‘%1%’ should be either ‘true’ or ‘false’, not ‘%2%’")
-        % name % i->second);
-}
-
-
-void Settings::_get(StringSet & res, const string & name)
-{
-    SettingsMap::iterator i = settings.find(name);
-    if (i == settings.end()) return;
-    res.clear();
-    Strings ss = tokenizeString<Strings>(i->second);
-    res.insert(ss.begin(), ss.end());
-}
-
-void Settings::_get(Strings & res, const string & name)
-{
-    SettingsMap::iterator i = settings.find(name);
-    if (i == settings.end()) return;
-    res = tokenizeString<Strings>(i->second);
-}
-
-
-template<class N> void Settings::_get(N & res, const string & name)
-{
-    SettingsMap::iterator i = settings.find(name);
-    if (i == settings.end()) return;
-    if (!string2Int(i->second, res))
-        throw Error(format("configuration setting ‘%1%’ should have an integer value") % name);
-}
-
-
-string Settings::pack()
-{
-    string s;
-    for (auto & i : settings) {
-        if (i.first.find('\n') != string::npos ||
-            i.first.find('=') != string::npos ||
-            i.second.find('\n') != string::npos)
-            throw Error("illegal option name/value");
-        s += i.first; s += '='; s += i.second; s += '\n';
-    }
-    return s;
-}
-
-
-void Settings::unpack(const string & pack) {
-    Strings lines = tokenizeString<Strings>(pack, "\n");
-    for (auto & i : lines) {
-        string::size_type eq = i.find('=');
-        if (eq == string::npos)
-            throw Error("illegal option name/value");
-        set(i.substr(0, eq), i.substr(eq + 1));
+    auto files = settings.nixUserConfFiles;
+    for (auto file = files.rbegin(); file != files.rend(); file++) {
+        globalConfig.applyConfigFile(*file);
     }
 }
 
-
-Settings::SettingsMap Settings::getOverrides()
+std::vector<Path> getUserConfigFiles()
 {
-    return overrides;
+    // Use the paths specified in NIX_USER_CONF_FILES if it has been defined
+    auto nixConfFiles = getEnv("NIX_USER_CONF_FILES");
+    if (nixConfFiles.has_value()) {
+        return tokenizeString<std::vector<string>>(nixConfFiles.value(), ":");
+    }
+
+    // Use the paths specified by the XDG spec
+    std::vector<Path> files;
+    auto dirs = getConfigDirs();
+    for (auto & dir : dirs) {
+        files.insert(files.end(), dir + "/nix/nix.conf");
+    }
+    return files;
 }
 
+unsigned int Settings::getDefaultCores()
+{
+    return std::max(1U, std::thread::hardware_concurrency());
+}
+
+StringSet Settings::getDefaultSystemFeatures()
+{
+    /* For backwards compatibility, accept some "features" that are
+       used in Nixpkgs to route builds to certain machines but don't
+       actually require anything special on the machines. */
+    StringSet features{"nixos-test", "benchmark", "big-parallel", "recursive-nix"};
+
+    #if __linux__
+    if (access("/dev/kvm", R_OK | W_OK) == 0)
+        features.insert("kvm");
+    #endif
+
+    return features;
+}
+
+bool Settings::isExperimentalFeatureEnabled(const std::string & name)
+{
+    auto & f = experimentalFeatures.get();
+    return std::find(f.begin(), f.end(), name) != f.end();
+}
+
+void Settings::requireExperimentalFeature(const std::string & name)
+{
+    if (!isExperimentalFeatureEnabled(name))
+        throw Error("experimental Nix feature '%1%' is disabled; use '--experimental-features %1%' to override", name);
+}
+
+bool Settings::isWSL1()
+{
+    struct utsname utsbuf;
+    uname(&utsbuf);
+    // WSL1 uses -Microsoft suffix
+    // WSL2 uses -microsoft-standard suffix
+    return hasSuffix(utsbuf.release, "-Microsoft");
+}
 
 const string nixVersion = PACKAGE_VERSION;
 
+template<> void BaseSetting<SandboxMode>::set(const std::string & str)
+{
+    if (str == "true") value = smEnabled;
+    else if (str == "relaxed") value = smRelaxed;
+    else if (str == "false") value = smDisabled;
+    else throw UsageError("option '%s' has invalid value '%s'", name, str);
+}
+
+template<> std::string BaseSetting<SandboxMode>::to_string() const
+{
+    if (value == smEnabled) return "true";
+    else if (value == smRelaxed) return "relaxed";
+    else if (value == smDisabled) return "false";
+    else abort();
+}
+
+template<> void BaseSetting<SandboxMode>::toJSON(JSONPlaceholder & out)
+{
+    AbstractSetting::toJSON(out);
+}
+
+template<> void BaseSetting<SandboxMode>::convertToArg(Args & args, const std::string & category)
+{
+    args.addFlag({
+        .longName = name,
+        .description = "Enable sandboxing.",
+        .category = category,
+        .handler = {[=]() { override(smEnabled); }}
+    });
+    args.addFlag({
+        .longName = "no-" + name,
+        .description = "Disable sandboxing.",
+        .category = category,
+        .handler = {[=]() { override(smDisabled); }}
+    });
+    args.addFlag({
+        .longName = "relaxed-" + name,
+        .description = "Enable sandboxing, but allow builds to disable it.",
+        .category = category,
+        .handler = {[=]() { override(smRelaxed); }}
+    });
+}
+
+void MaxBuildJobsSetting::set(const std::string & str)
+{
+    if (str == "auto") value = std::max(1U, std::thread::hardware_concurrency());
+    else if (!string2Int(str, value))
+        throw UsageError("configuration setting '%s' should be 'auto' or an integer", name);
+}
+
+
+void initPlugins()
+{
+    for (const auto & pluginFile : settings.pluginFiles.get()) {
+        Paths pluginFiles;
+        try {
+            auto ents = readDirectory(pluginFile);
+            for (const auto & ent : ents)
+                pluginFiles.emplace_back(pluginFile + "/" + ent.name);
+        } catch (SysError & e) {
+            if (e.errNo != ENOTDIR)
+                throw;
+            pluginFiles.emplace_back(pluginFile);
+        }
+        for (const auto & file : pluginFiles) {
+            /* handle is purposefully leaked as there may be state in the
+               DSO needed by the action of the plugin. */
+            void *handle =
+                dlopen(file.c_str(), RTLD_LAZY | RTLD_LOCAL);
+            if (!handle)
+                throw Error("could not dynamically open plugin file '%s': %s", file, dlerror());
+        }
+    }
+
+    /* Since plugins can add settings, try to re-apply previously
+       unknown settings. */
+    globalConfig.reapplyUnknownSettings();
+    globalConfig.warnUnknownSettings();
+}
 
 }
